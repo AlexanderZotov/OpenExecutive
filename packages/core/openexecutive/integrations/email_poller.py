@@ -774,6 +774,11 @@ async def _run_executive(
     # through the decision extractor as the principal's own words
     # (`content_trust.principal_speaking`).
     session = Session(**session_kwargs, origin_channel="email")
+    # The email this turn answers is one it may read, reply in or quote,
+    # whoever sent it (orchestrator.teammate_mail).
+    from openexecutive.orchestrator.teammate_mail import allow_mail_ids
+
+    allow_mail_ids(session, message_id, thread_id)
     if from_addr:
         # Who the mail claims to be from, and whether Gmail authenticated it:
         # the fact tools let the principal's own authenticated mail ask for a
@@ -794,6 +799,19 @@ async def _run_executive(
         session.email_authenticated = bool(principal) and session.email_from == principal and (
             await sender_authenticated(gateway, message_id, from_addr)
         )
+        if not session.email_authenticated:
+            # A teammate's own mail is theirs to read back only when Gmail
+            # vouches the email is from them (orchestrator.teammate_mail).
+            from openexecutive.people.identity import resolve_email_sender
+
+            try:
+                sender = resolve_email_sender(from_addr)
+                if sender is not None and not sender.is_principal:
+                    session.email_sender_authenticated = await sender_authenticated(
+                        gateway, message_id, from_addr
+                    )
+            except Exception:  # noqa: BLE001 - optional step; must not lose the email.
+                logger.warning("sender check failed; teammate mail stays private this turn", exc_info=True)
     if from_addr:
         # Only register the sender as a schedulable channel_ref if they
         # are in the People roster. Without this guard, an attacker who

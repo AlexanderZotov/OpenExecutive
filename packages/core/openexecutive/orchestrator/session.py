@@ -32,6 +32,11 @@ class Session:
     # Used by schedule_followup to refuse scheduling sends to refs the user
     # never actually used — anti-spam guard.
     seen_channel_refs: set[tuple[str, str]] = field(default_factory=set)
+    # Mailbox message and thread ids this conversation was shown by a search
+    # that left other teammates' mail out (or the inbound email it answers).
+    # The model may reach the Executive's mailbox only by these
+    # (orchestrator.teammate_mail).
+    mail_ids_seen: set[str] = field(default_factory=set)
     # Which inbound channel this session arrived on ("slack", "discord",
     # "telegram", "google_chat", "email"), and the address on it. Empty for
     # web/CLI turns and runs nobody started from a channel. Used when a
@@ -142,6 +147,10 @@ class Session:
     # (``orchestrator.fact_tools``) — a From line alone proves nothing.
     email_from: str = ""
     email_authenticated: bool = False
+    # Whether Gmail authenticated the From of a teammate's (not the
+    # principal's) inbound email: only then does the turn read the mailbox as
+    # that teammate (orchestrator.teammate_mail).
+    email_sender_authenticated: bool = False
     # Act as me for the turn in progress (``delegation.settings.TurnDelegation``),
     # pinned at its start by ``pin_turn_delegation``: whether the speaker has
     # it on, whether ``ghostwrite_email`` is offered, and whether the turn has
