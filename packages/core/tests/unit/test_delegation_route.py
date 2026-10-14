@@ -93,6 +93,39 @@ def test_a_request_without_a_sign_in_is_refused(
     assert client.get("/delegation").status_code == 200
 
 
+def _roster_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sqlite3
+    from contextlib import contextmanager
+
+    @contextmanager
+    def broken(db_path: Any = None) -> Iterator[Any]:
+        raise sqlite3.OperationalError("database is locked")
+        yield
+
+    monkeypatch.setattr(people_store, "_get_conn", broken)
+
+
+def test_a_roster_it_cannot_read_says_so(
+    client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _roster_down(monkeypatch)
+    resp = client.get("/delegation", headers=OWNER)
+    assert resp.status_code == 503 and resp.json()["detail"]["code"] == "roster_unavailable"
+
+
+def test_it_knows_the_caller_the_way_the_rest_of_the_app_does(
+    client: TestClient, ids: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A deployment can map a signed-in account to its person in the shared
+    # caller resolver; Act as me must follow that, not look the email up again.
+    monkeypatch.setattr(
+        "openexecutive.api.routes.chat._resolve_caller_person_id", lambda request: ids["principal"],
+    )
+    resp = client.get("/delegation", headers={"x-caller-email": "signed-in@elsewhere.example"})
+    assert resp.status_code == 200
+    assert "--email olivia@co.example" in resp.json()["gmail"]["connect_command"]
+
+
 @pytest.mark.parametrize(("status", "code"), [
     ("not_configured", "gmail_not_connected"),
     ("needs_reconnect", "gmail_needs_reconnect"),
