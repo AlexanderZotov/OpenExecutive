@@ -4,7 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNo
 
 import Icon from "@/components/Icon";
 import AdvancedFold from "@/components/settings/AdvancedFold";
-import ModePicker from "@/components/settings/ModePicker";
+import ReachCard from "@/components/settings/ReachCard";
 import SettingsCard from "@/components/settings/SettingsCard";
 import Switch from "@/components/Switch";
 import Button from "@/components/ui/Button";
@@ -16,11 +16,9 @@ import {
   learnVoiceProfile,
   refreshVoiceSignature,
   resetVoiceProfile,
-  setDelegationEnabled,
   setDelegationTeam,
   setInboxWatch,
   setReadMyCalendar,
-  setTraining,
   updateVoiceProfile,
   type DelegationSettings,
   type DelegationTeam,
@@ -33,16 +31,17 @@ import { formatAgo } from "@/lib/setupStatus";
 import { addPhrase, markNew, STYLE_PHRASES, styleSentences } from "@/lib/voiceStyle";
 
 // Delegate → Act as me: let the Executive draft email AS you, in your own
-// Gmail Drafts, when you ask it to — and, with Draft replies to my inbox on,
-// for mail that needs you, which it sends when you tap Send on Today (or on
+// Gmail Drafts, when you ask it to — and, with How far it goes as you at
+// Drafts for my inbox or above, for mail that needs you, which it sends when you tap Send on Today (or on
 // its own, under Handle it for me).
-// Backed by GET/PUT /delegation, /delegation/inbox and /delegation/voice.
+// Backed by GET /delegation, PUT /delegation/reach (ReachCard) and /delegation/voice.
 // Not offered to anyone who can't have it (the owner can, and team members
 // once the owner lets them: PUT /delegation/team) or on a backend without
 // it: the hub then shows no tile, and this page says so.
 //
-// The page body: the mailbox, Write drafts as me and Draft replies to my
-// inbox up front; How I write and Let team members use it under Advanced.
+// The page body: the mailbox, How far it goes as you and, while the inbox
+// watcher is on, Your inbox up front; How I write and Let team members use
+// it under Advanced.
 
 export const ACT_AS_ME_INTRO =
   "Let the Executive write email as you, in your own voice. When you ask it to reply to or write an email as you, it saves a draft in your own mailbox (Gmail or Outlook) for you to review and send. Nothing goes out as you unless you send it, from your mailbox or with Send on a reply waiting on Today. Everything else it writes stays in its own name.";
@@ -77,8 +76,6 @@ function greetingFields(p: VoiceProfile): Record<string, string> {
   return Object.fromEntries(AUDIENCES.map((a) => [a, p.greetings[a] ?? ""]));
 }
 
-type DraftsMode = "off" | "training" | "on";
-
 // `onSettings` hears every change made here, so the page's other cards
 // (Handle it for me, What it's learned) keep up; `children` sit after Draft
 // replies to my inbox, before Advanced.
@@ -99,7 +96,6 @@ export default function ActAsMeCard({
   );
   const [state, setState] = useState<"loading" | "hidden" | "ready" | "error">("loading");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -174,30 +170,8 @@ export default function ActAsMeCard({
   const mailbox = outlook ? "Outlook" : "Gmail";
   const on = settings.enabled;
 
-  // Off / In training / On: On and In training both write drafts; In
-  // training also offers "Do it like this next time" on a draft you changed
-  // (Drafts in training, delegation/training.py).
-  const draftsMode: DraftsMode = !on ? "off" : settings.training?.drafts ? "training" : "on";
-  const pickDrafts = async (next: DraftsMode) => {
-    setBusy(true);
-    setError(null);
-    try {
-      if (next === "off") {
-        setSettings(await setDelegationEnabled(false));
-      } else {
-        if (!on) setSettings(await setDelegationEnabled(true));
-        setSettings(await setTraining({ drafts: next === "training" }));
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not save the setting.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const recheck = async () => {
     setBusy(true);
-    setError(null);
     await load();
     setBusy(false);
   };
@@ -246,41 +220,13 @@ export default function ActAsMeCard({
         )}
       </SettingsCard>
 
-      <SettingsCard
-        title="Write drafts as me"
-        titleId="act-as-me-label"
-        description={
-          on || connected
-            ? `Ask it in chat — “reply to Dana as me: yes to the 5th” — and the draft waits in your ${mailbox} Drafts. Nothing is sent.`
-            : "Connect your mailbox first."
-        }
-      >
-        <ModePicker<DraftsMode>
-          labelledBy="act-as-me-label"
-          value={draftsMode}
-          disabled={busy || (!on && !connected)}
-          options={[
-            { value: "off", label: "Off" },
-            { value: "training", label: "In training" },
-            { value: "on", label: "On" },
-          ]}
-          onPick={(next) => void pickDrafts(next)}
-        />
-        <p className="mt-3 text-sm text-fg-muted leading-relaxed">
-          {draftsMode === "training"
-            ? "When you change a draft, tick Do it like this next time and it learns how you write to that person."
-            : draftsMode === "on"
-              ? "It writes drafts as you, in the style under How I write."
-              : "The Executive only ever writes as itself."}
-        </p>
-        {error && <p className="mt-2 text-sm text-red-500">{error}</p>}
-      </SettingsCard>
+      {connected || on ? (
+        <ReachCard settings={settings} onSettings={setSettings} />
+      ) : null}
 
-      {settings.inbox && (
+      {settings.inbox?.enabled && (
         <InboxSection
           inbox={stoppedWaiting ? { ...settings.inbox, checking: false } : settings.inbox}
-          actAsMeOn={on}
-          handleItOn={!!settings.handle_it?.enabled}
           mailbox={settings.gmail?.provider === "microsoft" ? "Outlook" : "Gmail"}
           onSettings={setSettings}
           onInbox={(inbox) => {
@@ -368,19 +314,17 @@ function TeamSection({
   );
 }
 
-// "Draft replies to my inbox" (PUT /delegation/inbox; Check now is POST
-// /delegation/inbox/check). Needs Act as me on; the replies wait on Today.
+// Your inbox, while the dial is at Drafts for my inbox or higher: how the
+// watcher is doing, Check now (POST /delegation/inbox/check) and where its
+// replies are kept (PUT /delegation/inbox {mailbox_drafts}). The switch
+// itself is a step of How far it goes as you.
 function InboxSection({
   inbox,
-  actAsMeOn,
-  handleItOn,
   mailbox,
   onSettings,
   onInbox,
 }: {
   inbox: InboxWatch;
-  actAsMeOn: boolean;
-  handleItOn: boolean;
   mailbox: string;
   onSettings: (next: DelegationSettings) => void;
   onInbox: (next: InboxWatch) => void;
@@ -388,18 +332,6 @@ function InboxSection({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const on = inbox.enabled;
-
-  const toggle = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      onSettings(await setInboxWatch({ enabled: !on }));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not save the setting.");
-    } finally {
-      setBusy(false);
-    }
-  };
 
   // Also keep each reply in their mailbox's Drafts (off: on its card alone).
   const inDrafts = !!inbox.mailbox_drafts;
@@ -430,25 +362,9 @@ function InboxSection({
   const last = inbox.last_poll_at && !inbox.checking ? ` Last checked ${formatAgo(inbox.last_poll_at)}.` : "";
   return (
     <SettingsCard
-      title="Draft replies to my inbox"
+      title="Your inbox"
       titleId="act-as-me-inbox-label"
-      description={
-        on
-          ? handleItOn
-            ? "When mail comes in that needs you, it writes a first reply. Handle it for me, on the next tab, sends the simple ones; the rest wait on Today, where you send, edit or dismiss them."
-            : "When mail comes in that needs you, it writes a first reply and puts it on Today, where you can edit it, send it or dismiss it. Nothing is sent until you tap Send."
-          : actAsMeOn
-            ? "Off: it only drafts when you ask it to in chat."
-            : "Turn on Write drafts as me first."
-      }
-      action={
-        <Switch
-          checked={on}
-          onChange={() => void toggle()}
-          disabled={busy || (!on && !actAsMeOn)}
-          labelledBy="act-as-me-inbox-label"
-        />
-      }
+      description="When mail comes in that needs you, it writes a first reply and puts it on Today, where you can edit it, send it or dismiss it."
     >
       {on && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
@@ -522,7 +438,7 @@ function CalendarSection({
           ? "Ask about your day or your week in chat and it reads your own calendar. It never changes it."
           : actAsMeOn
             ? "Off: it can't see your calendar. On, it reads it when you ask, and never changes it."
-            : "Turn on Write drafts as me first."
+            : "Move How far it goes as you up from Off first."
       }
       action={
         <Switch

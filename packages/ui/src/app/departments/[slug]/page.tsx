@@ -59,7 +59,7 @@ const AUTHORITY_META: Record<
     hint: "The specialist drafts actions and routes them to a person for approval before anything happens.",
   },
   escalate: {
-    label: "Escalates to a human",
+    label: "Escalates to a person",
     hint: "The specialist will not act — it forwards everything to a human.",
   },
 };
@@ -661,6 +661,11 @@ export default function DepartmentDetailPage() {
                             </label>
                           );
                         })}
+                        <p className={HINT_CLS}>
+                          This covers the department&apos;s check-ins, scheduled messages and alerts, and what its team
+                          members ask for in chat; Operations also covers meetings people ask for. It doesn&apos;t cover
+                          what the Executive does on its own under Take the lead: Always asks first holds that.
+                        </p>
                       </fieldset>
 
                       <CheckInPicker
