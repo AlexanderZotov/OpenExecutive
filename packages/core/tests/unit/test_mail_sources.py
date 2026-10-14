@@ -349,3 +349,27 @@ def test_a_source_session_never_shares_the_mailboxs(turn: dict[str, Any]) -> Non
     mail.session_id = ""
     _handle(mail)
     assert turn["turns"][0]["session"].session_id == "email:relay:t1"
+
+
+def test_a_crashed_source_is_logged(
+    registry: dict[str, MailSource], caplog: pytest.LogCaptureFixture
+) -> None:
+    async def _run() -> None:
+        raise RuntimeError("network down")
+
+    mail_sources.register_mail_source(MailSource(name="relay", run=_run))
+
+    async def _start() -> None:
+        tasks = mail_sources.start_mail_sources()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    # The app's logging setup stops ``openexecutive`` loggers propagating, so
+    # once any test has built the app, caplog only sees what reaches it here.
+    mail_sources.logger.addHandler(caplog.handler)
+    try:
+        asyncio.run(_start())
+    finally:
+        mail_sources.logger.removeHandler(caplog.handler)
+    assert "mail-source-relay stopped" in caplog.text
+
