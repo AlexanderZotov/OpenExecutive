@@ -323,12 +323,32 @@ def _audit(tool: str, kind: str, ok: bool, summary: str, details: dict[str, Any]
 # own user id, over an authenticated connection). Email (an unauthenticated
 # From header), Google Chat (its sender is matched by email for the department gate only), the CLI, the MCP server and
 # unattended runs (scheduler, workflows, alert review) don't. Telegram only
-# sometimes — see `_is_verified_speaker_surface`.
+# sometimes — see `_is_verified_speaker_surface`. A channel adapter this module
+# doesn't know counts when it verified the sender itself
+# (`Session.speaker_verified`, with the `caller_person_id` it resolved).
 _VERIFIED_SPEAKER_CHANNELS = frozenset({"slack", "discord"})
+
+
+def _adapter_verified_turn(session: Any) -> bool:
+    """The rest of what an adapter's ``speaker_verified`` needs to count, as
+    ``history_chat.verified_speaker`` asks of it: a resolved caller, a turn
+    someone is in that no email started, not private to the principal and
+    not run on their behalf (an eval's ``delegation_override``)."""
+    from openexecutive.delegation.settings import DelegationOverride
+
+    return (
+        getattr(session, "caller_person_id", None) is not None
+        and not getattr(session, "email_from", "")
+        and getattr(session, "unattended", False) is not True
+        and getattr(session, "private_to_principal", False) is not True
+        and not isinstance(getattr(session, "delegation_override", None), DelegationOverride)
+    )
 
 
 def _is_verified_speaker_surface(session: Any) -> bool:
     if bool(getattr(session, "from_web_chat", False)):
+        return True
+    if getattr(session, "speaker_verified", False) is True and _adapter_verified_turn(session):
         return True
     channel = str(getattr(session, "origin_channel", "") or "")
     if channel in _VERIFIED_SPEAKER_CHANNELS:
@@ -516,33 +536,43 @@ def audit_row_private_to_principal(*payloads: Any) -> bool:
     return _names_a_contact(payloads)
 
 
-def sent_by_principal(channel: str, channel_ref: str, sender: Any) -> bool:
+def sent_by_principal(
+    channel: str, channel_ref: str, sender: Any, *, speaker_verified: bool = False
+) -> bool:
     """Whether a message a chat adapter received on ``channel`` from
     ``sender`` (the Person it resolved, or None) starts the principal's own
     verified turn — what ``is_principal_on_verified_surface`` answers once the
     turn's session is bound. ``channel_ref`` is the id that session carries as
     its ``origin_channel_ref`` (Telegram's chat id decides whether it is
-    verified at all)."""
+    verified at all). ``speaker_verified``: the adapter verified ``sender``
+    itself, as it will say on the turn's session (``Session.speaker_verified``)."""
     if sender is None or getattr(sender, "is_principal", False) is not True:
         return False
     if getattr(sender, "archived", False) is True:
         return False
-    surface = SimpleNamespace(
-        from_web_chat=False, origin_channel=channel, origin_channel_ref=channel_ref
+    return _is_verified_speaker_surface(_inbound_surface(channel, channel_ref, sender, speaker_verified))
+
+
+def _inbound_surface(channel: str, channel_ref: str, sender: Any, speaker_verified: bool) -> SimpleNamespace:
+    """The surface an inbound message's turn will have, before its session exists."""
+    return SimpleNamespace(
+        from_web_chat=False,
+        origin_channel=channel,
+        origin_channel_ref=channel_ref,
+        speaker_verified=speaker_verified,
+        caller_person_id=getattr(sender, "id", None),
     )
-    return _is_verified_speaker_surface(surface)
 
 
-def sent_by_teammate(channel: str, channel_ref: str, sender: Any) -> int | None:
+def sent_by_teammate(
+    channel: str, channel_ref: str, sender: Any, *, speaker_verified: bool = False
+) -> int | None:
     """The teammate (not the principal) a chat adapter's inbound message on
     ``channel`` is from, when the channel proved who sent it — the person
     whose own turn it starts (``teammate_turn_owner``) — else None."""
     if sender is None or getattr(sender, "id", None) is None:
         return None
-    surface = SimpleNamespace(
-        from_web_chat=False, origin_channel=channel, origin_channel_ref=channel_ref
-    )
-    if not _is_verified_speaker_surface(surface):
+    if not _is_verified_speaker_surface(_inbound_surface(channel, channel_ref, sender, speaker_verified)):
         return None
     return team_member_id(int(sender.id))
 
