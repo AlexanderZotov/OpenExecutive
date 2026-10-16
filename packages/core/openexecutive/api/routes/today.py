@@ -38,6 +38,7 @@ from openexecutive.clients.cockpit import ClientCockpitCard, format_practice_for
 
 if TYPE_CHECKING:
     from openexecutive.alerts.models import Alert
+    from openexecutive.briefing.reader import Reader
     from openexecutive.people.models import Person
 
 logger = logging.getLogger(__name__)
@@ -1606,14 +1607,22 @@ def _header_live(include_private: bool, now: datetime | None = None) -> tuple[An
     return signals, window, now_label
 
 
+# `_narrative_context(reader=…)` left out: look the reader up there.
+_LOOKUP = object()
+
+
 def _narrative_context(
     today_data: dict[str, Any],
     viewer: PersonBriefItem | None,
     viewer_desc: dict[str, str] | None,
     mode: str = "team",
     scope: str | None = None,
+    reader: Reader | None | object = _LOOKUP,
 ) -> tuple[str, list[dict[str, Any]] | None]:
     """``(context, activity)`` — the exact user turn the model would receive.
+
+    ``reader`` is who the header is written for (``_narrative_reader``); the
+    regeneration resolves it once and hands the same one to the post-check.
 
     The single source both the cache key and the model call come from, so the
     key can never be computed over something the model did not see.
@@ -1665,8 +1674,21 @@ def _narrative_context(
         now_label=now_label,
         getting_started=getting_started,
         brief_requests=viewer_desc is None and scope == narrative_cache.DEFAULT_SCOPE,
+        reader=_narrative_reader(scope, viewer) if reader is _LOOKUP else reader,  # type: ignore[arg-type]
     )
     return context, activity
+
+
+def _narrative_reader(scope: str | None, viewer: PersonBriefItem | None) -> Reader | None:
+    """Who a scope's header is written for: the teammate on their own scope,
+    else the principal. The whole-company scope (no signed-in caller) uses
+    the same prompt as the principal's, which narrates the principal's day,
+    so it is written to them too, from the shared rows only."""
+    from openexecutive.briefing.reader import person_reader, principal_reader
+
+    if viewer is not None and scope is not None and scope.startswith("person:"):
+        return person_reader(viewer.id)
+    return principal_reader()
 
 
 # One regeneration per scope at a time. Every stale view schedules one, and
@@ -1802,6 +1824,7 @@ async def _regen_briefing_narrative_locked(
     from openexecutive.briefing.narrative import (
         QUIET_PRINCIPAL,
         QUIET_VIEWER,
+        REWRITE_TIMEOUT_S,
         synthesize_briefing_narrative,
     )
     from openexecutive.memory.workspace_settings import get_workspace
@@ -1819,7 +1842,10 @@ async def _regen_briefing_narrative_locked(
                 "regen; skipping write", expected_scope, scope,
             )
             return True
-        context, activity = _narrative_context(today_data, viewer, viewer_desc, mode, scope)
+        reader = _narrative_reader(scope, viewer)
+        context, activity = _narrative_context(
+            today_data, viewer, viewer_desc, mode, scope, reader=reader,
+        )
         input_hash = narrative_cache.build_narrative_input_hash(context, scope=scope, mode=mode)
         cached = narrative_cache.get(scope)
         if cached is not None and cached.input_hash == input_hash:
@@ -1838,8 +1864,10 @@ async def _regen_briefing_narrative_locked(
                     # Hand the model the very string that was hashed.
                     rendered_context=context,
                     mode=mode,
+                    reader=reader,
                 ),
-                timeout=25.0,
+                # 25 s for the draft, plus the rewrite's own budget.
+                timeout=25.0 + REWRITE_TIMEOUT_S,
             )
     except Exception:
         logger.exception("today: briefing narrative regen failed (scope=%s)", expected_scope)

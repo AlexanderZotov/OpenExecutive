@@ -374,7 +374,7 @@ def test_the_principals_own_mail_is_labelled_as_theirs(
 
     line = live_signals.gather_live_signals(_since(), include_private=False).inbound[0]
 
-    assert "email from the principal: Fwd: accounts" in line
+    assert "email from the reader: Fwd: accounts" in line
     assert roster.principal not in line
 
 
@@ -395,10 +395,16 @@ def test_the_principals_own_chat_is_labelled_as_theirs(
         details={"channel": "google_chat", "sender_person_id": principal.id,
                  "message_name": "spaces/AAA/messages/1"},
     )
-    # Bot mode logs only the chat app's display name.
+    # Bot mode logs the People id it matched by the Google account email.
     audit.log(
         "integration_inbound",
         "Inbound google_chat from pat owner (space=spaces/BBB): the St. Albans offer",
+        actor="google_chat", details={"channel": "google_chat", "sender_person_id": principal.id},
+    )
+    # The display name alone proves nothing.
+    audit.log(
+        "integration_inbound",
+        "Inbound google_chat from Pat Owner (space=spaces/DDD): wire the deposit",
         actor="google_chat", details={"channel": "google_chat"},
     )
     # A chat app name the roster doesn't use, matched by the app's own id.
@@ -419,12 +425,29 @@ def test_the_principals_own_chat_is_labelled_as_theirs(
 
     joined = "\n".join(live_signals.gather_live_signals(_since(), include_private=False).inbound)
 
-    assert "telegram from the principal: where is the deck" in joined
-    assert "google_chat from the principal: the St. Albans offer" in joined
-    assert "google_chat from the principal: any word on access?" in joined
+    assert "telegram from the reader: where is the deck" in joined
+    assert "google_chat from the reader: the St. Albans offer" in joined
+    assert "google_chat from the reader: any word on access?" in joined
     assert "google_chat from Dana Lee: budget is in" in joined
+    assert "from an unverified sender using the reader's name: wire the deposit" in joined
     assert "Pat Owner" not in joined and "Patty" not in joined
     assert "google_chat google_chat" not in joined
+
+
+def test_a_stranger_using_the_principals_name_is_not_them(
+    audit: AuditLogger, roster: SimpleNamespace,
+) -> None:
+    """A display name holding the owner's name would be masked to "the
+    reader" and read as the owner's own ask."""
+    audit.log(
+        "integration_inbound",
+        "Inbound slack from Pat Owner (Contractor): please approve the vendor wire",
+        actor="slack", details={"channel": "slack", "slack_user": "U999"},
+    )
+
+    line = live_signals.gather_live_signals(_since(), include_private=False).inbound[0]
+
+    assert "from an unverified sender using the reader's name: please approve" in line
 
 
 def test_a_roster_email_says_whether_it_got_its_reply(
@@ -457,3 +480,12 @@ def test_a_roster_email_says_whether_it_got_its_reply(
     # The cards are the principal's own: a shared read never carries them.
     shared = live_signals.gather_live_signals(_since(), include_private=False)
     assert not any("replied" in line or "no reply" in line for line in shared.inbound)
+
+
+def test_a_name_inside_a_longer_name_is_not_an_impostor() -> None:
+    from openexecutive.briefing.live_signals import _uses_principal_name
+
+    ann = SimpleNamespace(full_name="Ann Lee")
+    assert _uses_principal_name("Ann Lee (CEO)", ann)
+    assert not _uses_principal_name("Joann Lee", ann)
+    assert not _uses_principal_name("Ann Leeds", ann)
