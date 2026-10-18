@@ -699,6 +699,14 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks) 
         logger.warning("Telegram: failed to parse JSON body")
         return {}
 
+    # Remember the chat by name for the People and department pickers
+    # (Telegram has no API that lists them). Only on a webhook whose secret
+    # was checked above: without one, anyone could post a made-up update.
+    if settings.telegram_webhook_secret and isinstance(body, dict):
+        from openexecutive.integrations.telegram_chats import record_from_update
+
+        record_from_update(body)
+
     # A tap on a card's Approve or Skip button (integrations.channel_cards).
     # Only on a webhook Telegram alone can call: otherwise anyone could post
     # a tap naming someone's chat.

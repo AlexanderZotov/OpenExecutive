@@ -5482,7 +5482,7 @@ audit:
     - alert — alert created by the triage pipeline
     - integration_inbound — Slack / Discord / email / Telegram / Google Chat message received. The chat adapters put the first 160 characters of the message in the summary; the email poller keeps the summary to sender and subject and stores the text in the full payload (`message` — the sender's new text, cut at 20,000 escaped JSON chars, the measure the 64 KB cap uses; `attachments` — filenames, 8,000 escaped chars; `body` — the whole body with its quoted chain, only on a row private to the principal, since the chain quotes other people's mail and a public row is every signed-in user's) with `details.preview` (120 chars of the new text) and `details.body_len`, so /audit shows the request next to the reply's `chat_turn` row. `details.outcome` distinguishes the non-reply paths — `rejected_unknown_sender` (not on the People roster), `skipped_gate` (response gate said no), `dropped_thread_unreadable` (Slack wouldn't return a thread the bot is in, so a continuation went unanswered; the sender was told), and `handler_error` (the turn raised; the user got the generic apology). The error row carries the same `session_id` as the inbound row, so /audit can join a failed turn to the message that caused it.
     - knowledge_retrieval — one row per `knowledge.retriever.retrieve()` call; details carry chunk counts + domains, full payload carries each chunk's source, distance, and text preview so the session view shows "which RAG chunks influenced this response"
-    - cache_event — one row per model call, from every call site (`audit.usage.log_model_usage`): Executive iterations and the committee revision pass (`actor` executive / committee_revision), `BaseAgent.analyze` callers — chat-turn consults via `route_parallel` (`actor` specialist), workflow steps and other direct `route_to_specialist` callers (specialist_workflow), the MCP `consult_specialist` tool (specialist_mcp), and both Council test boxes (agent_test) — `BaseAgent.analyze_with_tools` callers (specialist_research, query_watch, signal_enrichment), the research synthesis and watchlist passes (research_synthesis / research_watchlist), triage, the chat memory extractor (memory_extractor), alert review (alert_review), the brief's narrative and grounding repair (briefing_narrative / briefing_grounding), the end_of_day_digest, executive_reflection and weekly_review workflows, wait_for_human reply parsing (workflow replies and roster answers) and the inbound_resolver, committee reviewers (committee_reviewer), the fixture and engagement generators (their agent names), and the utility calls — session_title, response_gate, person_insight, initiatives_consolidation, pdf_reader, the chat page's suggested_prompts / followup_suggestion, and the eval runner's eval_judge. `tests/unit/test_usage_recording.py::test_every_model_call_records_usage` walks the package's AST and fails on any function that calls `messages_create` / `messages_stream` without calling `log_model_usage` (directly, through a same-module wrapper such as the Executive's `_emit_cache_event`, or from an enclosing function), so a new call site cannot skip the row silently; `providers/` and the runtime-dead `architecture/generator.py` are exempt, and the repo-root `evals/` harness is out of scope (its judges call the package's `evals.judges.judge_message`, which records the eval_judge row and uses `EVAL_JUDGE_MODEL`, default Opus). Captures `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `cost_usd`, `web_search_requests` (from `usage.server_tool_use`), `stop_reason`, and — inside a research run — the run's `run_id`, so prompt-cache hits are visible per turn, plus `cost_usd` — the actual USD OpenRouter charged for the call (read from `usage.cost`; null on the Anthropic-direct path or for rows logged before cost capture shipped). This is the token-usage + cost source of truth aggregated by both `/audit/sessions/{id}` (per session) and `/audit/usage` (cross-session).
+    - cache_event — one row per model call, from every call site (`audit.usage.log_model_usage`): Executive iterations and the committee revision pass (`actor` executive / committee_revision), `BaseAgent.analyze` callers — chat-turn consults via `route_parallel` (`actor` specialist), workflow steps and other direct `route_to_specialist` callers (specialist_workflow), the MCP `consult_specialist` tool (specialist_mcp), and both Council test boxes (agent_test) — `BaseAgent.analyze_with_tools` callers (specialist_research, query_watch, signal_enrichment), the research synthesis and watchlist passes (research_synthesis / research_watchlist), triage, the chat memory extractor (memory_extractor), alert review (alert_review), the brief's narrative and grounding repair (briefing_narrative / briefing_grounding), the end_of_day_digest, executive_reflection and weekly_review workflows, wait_for_human reply parsing (workflow replies and roster answers) and the inbound_resolver, committee reviewers (committee_reviewer), the fixture and engagement generators (their agent names), and the utility calls — session_title, watchlist_describe, response_gate, person_insight, initiatives_consolidation, pdf_reader, the chat page's suggested_prompts / followup_suggestion, and the eval runner's eval_judge. `tests/unit/test_usage_recording.py::test_every_model_call_records_usage` walks the package's AST and fails on any function that calls `messages_create` / `messages_stream` without calling `log_model_usage` (directly, through a same-module wrapper such as the Executive's `_emit_cache_event`, or from an enclosing function), so a new call site cannot skip the row silently; `providers/` and the runtime-dead `architecture/generator.py` are exempt, and the repo-root `evals/` harness is out of scope (its judges call the package's `evals.judges.judge_message`, which records the eval_judge row and uses `EVAL_JUDGE_MODEL`, default Opus). Captures `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `cost_usd`, `web_search_requests` (from `usage.server_tool_use`), `stop_reason`, and — inside a research run — the run's `run_id`, so prompt-cache hits are visible per turn, plus `cost_usd` — the actual USD OpenRouter charged for the call (read from `usage.cost`; null on the Anthropic-direct path or for rows logged before cost capture shipped). This is the token-usage + cost source of truth aggregated by both `/audit/sessions/{id}` (per session) and `/audit/usage` (cross-session).
     - memory_snapshot — one row at Executive turn entry; captures the system-block layout, conversation history length, episodic context (full text in `full_json`), and a company-profile hash so the session view can render "what the agent saw" before any API call
     - committee_review — one row per committee-reviewed turn; carries draft length, final length, per-reviewer critiques and timings (previously emitted but newly declared as a recognised event_type)
     - peer_memory — one row per `openexecutive.memory.honcho_client` call (prefetch / sync_turn / seed_identity / directional_chat / prefetch_department / sync_department_turn / append_department_note); carries `op`, `person_id`, optional `department_slug`, `outcome` (ok / timeout / error / disabled / no_person / no_department / no_loop / empty), `duration_ms`, plus op-specific details (query preview, reasoning_level, peer count, co_present_person_ids, co_present_department_slugs, originating_person_id, target_person_id, session_id, kind) so the flow-chart view renders the peer_memory path alongside `<retrieved_context>` and `<past_decisions>`. Disabled / no-Person / no-Department turns still emit (outcome marker) so audit absence equals "code path never ran" instead of "the provider was down."
@@ -5753,6 +5753,48 @@ external_monitoring:
       with reason), "Added by the Executive · rationale" on research cards
       with "Stop watching…", the morning brief's HANDLED block (watching /
       stopped_watching) and a one-line WATCH SUGGESTIONS WAITING count.
+  plain_words_setup: |
+    The /watchlist page starts from a sentence ("What should I watch?").
+    POST /watchlist/describe {text} calls monitoring.describe.describe_watch:
+    one forced draft_watch tool call on the utility-fast model (actor
+    watchlist_describe), whose field guidance is copied from the chat
+    add_watchlist_entry tool. The system prompt is a constant; the company
+    profile's name, competitors, vendors and tickers go in the USER turn
+    (company_context block) beside the request block, never a cached block.
+    - the model's fields go through the create route's checks before the
+      person sees them: registered kind, ticker shape, the SSRF URL guard
+      (in a worker thread, it resolves the host), the rss feed check
+      (validate_and_normalize_target, which may turn a feed-less page into a
+      page_watch or refuse it), cadence / severity (a floor above the
+      ceiling lifts the ceiling), trigger keys the adapter doesn't read
+      dropped, and a free slug (validation.suggest_watch_slug, the same rule
+      as the UI's suggestWatchSlug, with -2, -3 ... when taken).
+    - the four plain lines (watching, tell_you_when, how_often, how_loud)
+      are written by code from the checked fields, never by the model, so
+      they describe exactly what POST /watchlist stores. The UI's
+      lib/watchWords.ts says triggers the same way on the detail page.
+    - nothing is saved: Start watching POSTs the draft to /watchlist,
+      Change something opens the by-hand form filled in from it.
+    - errors are plain: 422 (empty, too long, or the model's own "cannot"
+      reason / a failed check), 429 past DESCRIBE_PER_HOUR (30, in-process) or
+      DESCRIBE_PER_CALLER_PER_HOUR (10 per signed-in caller),
+      502 / 504 when the model call fails or times out.
+    - create's display_label now maps to the adapter's label key for every
+      kind (validation.display_label_config, shared with the chat tool), so
+      a drafted query / edgar / page_watch keeps its name.
+  noisy_watch_question: |
+    monitoring.noise.watch_noise reads the statuses of the newest 8 alerts a
+    watch promoted (alerts joined through external_signals.promoted_alert_id,
+    one row per alert). At 6 dismissed GET /watchlist/{slug} returns
+    noise.noisy and the detail page asks "Only tell you about bigger
+    changes?": double a stock's abs_change_pct_gte (whole percent, at most
+    100), otherwise one step up the severity floor; Stop watching (the
+    delete confirmation); Keep as is. Each answer PATCHes
+    quiet_noise_nudge: true, which stores the newest alert id in
+    config_json._noise_nudge_after_alert_id (json_set, no read-modify-write);
+    only later alerts count, so the question comes back only after a fresh
+    run of dismissals. Separate from the research sweep's auto-disable,
+    which reads dismiss_count and trust_score and only touches research rows.
   data_model:
     watchlist (in episodic_memory.db): |
       One row per condition the user wants monitored. Mutable per-row
@@ -7600,6 +7642,53 @@ auth:
         script and by the UI (scripts/callerAssertion.test.mjs).
 
 integrations:
+  chat_directory: |
+    No raw chat ids: the person page, Add person and a department's
+    Channels settings pick Slack, Discord and Telegram people and rooms by
+    name (integrations/chat_directory.py; GET /chat-directory/people,
+    /chat-directory/channels, /chat-directory/slack/lookup?email= in
+    api/routes/chat_directory.py). The id is still what is saved, and the
+    by-hand field stays under "Enter an ID by hand" (all there is for a
+    provider with no bot).
+      • Slack: conversations.list (public + private the bot is in;
+        channels:read, groups:read, public only on missing_scope) and
+        users.list (no bots, no deactivated; users:read, users:read.email
+        for the profile email). users.lookupByEmail matches a person by
+        work email after the cached list; the picker pre-selects it as
+        "Found by email" with "Not them?".
+      • Discord: REST API with the bot token. Text and announcement
+        channels of the bot's servers (DISCORD_GUILD_IDS when set) and
+        their members. Members need the Server Members privileged intent;
+        a 401/403 reads as members_available=false with no options, not
+        an error.
+      • Telegram: no list API, so telegram_bot's webhook records each
+        chat an update comes from (integrations/telegram_chats.py,
+        table telegram_chats: chat_id PK, chat_type, title, username,
+        first_seen_at, last_seen_at; newest 250 kept per kind, so new
+        groups never push people out). Private chats are
+        people, group/supergroup are rooms. A group that migrated to a
+        supergroup or removed the bot is dropped.
+      • TRUST: Telegram chats are recorded only when TELEGRAM_WEBHOOK_SECRET
+        checked out; without it anyone could post an update putting a name
+        of their choice next to a chat id. A row is a suggestion only and
+        grants nothing; the roster still gates who is answered. Anyone can
+        still pick their own Telegram name, so each person option's detail
+        shows what they can't choose: the @username, when they first wrote,
+        and who on the roster already has that chat ("already linked to X").
+      • The routes are the principal's alone (chat._caller_is_principal_or_unclaimed,
+        the same rule as changing the People list). Channels also open while
+        no one is principal yet (first setup); people and the email lookup
+        wait for a principal, since they name everyone in the company's
+        Slack and Discord with their email. Anyone else gets 403 and the
+        pickers fall back to the by-hand field.
+      • Each provider/kind is cached in-process for 60 s, capped at 2,000
+        items; a provider that fails reads as ok=false with no options.
+        configured=false when the token is unset. Tokens go only in the
+        Authorization header to slack.com / discord.com, never returned.
+      • A department's Slack/Discord pickers pre-select the room named most
+        like the department (lib/chatDirectory.closestOption in the UI);
+        saved only when the person presses Save.
+      • telegram_chats is per company: clients.slots._BLANK_WIPE_TABLES.
   chat_app_conversations: |
     A Telegram chat, a Slack or Discord DM and a person's @mentions in
     one channel are each one endless stream with a fixed base id
@@ -10539,6 +10628,33 @@ delegation:
     "call_tool:<unlisted>": that name is the model's own text, which mail
     could steer, and the log is not private (the audit row keeps it). The
     same goes for a turn private to the principal.
+  reply_answers: |
+    delegation.answers — "Decide before sending" with taps. The ghostwriter's
+    compose_reply tool returns each open question as {question, choices
+    (2-4 short answers the writer might pick, never facts), about (time,
+    document, other)}; ghostwriter.parse_questions also takes plain strings,
+    so a model answering in the old shape still gives its questions.
+    ComposedDraft keeps open_questions as strings (chat, Handle it, the
+    evals and every reader use them unchanged) plus question_choices in the
+    same order. On a card (inbox.compose_reply, follow_ups) answers.suggest
+    fills two kinds in code: a time question, with Read my calendar on and
+    the scan's mailbox client, gets up to 3 free half hours, one a day over
+    the next 5 working days from tomorrow (calendar.events_for, then
+    briefing.top_three.free_gaps in the workspace zone and business hours;
+    all-day and declined events don't block), source "I checked your
+    calendar: these are free."; only times are used, never an event's
+    title, and no model sees them. A document question whose words match a
+    company document's name (knowledge.loader.list_company_docs) gets
+    'I'll send "<name>" separately', source 'Found "<name>" in your
+    documents.' Attaching is not offered: a card's draft is plain text
+    (card_drafts keeps no files and update_draft_text refuses a draft with
+    files), so a choice never says a file is attached. The card payload
+    stores question_choices beside open_questions; cards made before it
+    have none and show plain questions. Answers are saved by POST
+    /delegation/replies/{id}/answer (see the delegation API notes);
+    answered_questions keeps {index: answer}. Send in the UI waits until
+    every question with choices is answered, unless the words were changed
+    by hand (questions_settled); the server doesn't add a send rule.
   inbox_watcher: |
     delegation.inbox — the second switch, "Draft replies to my inbox"
     (delegation_inbox_watch: person_id, enabled, watch_since, last_poll_at,
@@ -10863,7 +10979,24 @@ delegation:
     /delegation/replies/{id}/text {text} changes a reply's words on its card
     and, when it is in their Drafts, there too, only while that draft is still
     the version the card last saw (409 draft_changed / draft_not_plain /
-    caller_signing_required, 422 empty / too_long); it sends nothing. Send is POST /decisions/{id}/approve (edits carry the
+    caller_signing_required, 422 empty / too_long); it sends nothing, and a
+    change by hand sets questions_settled. POST
+    /delegation/replies/{id}/answer {answers: [{question_index,
+    answer_text}]} (delegation.answers) answers what the reply left open:
+    one composer-model call (REWRITE_PROMPT + the person's voice block, no
+    tools, the draft and answers tag-scrubbed in the user turn) rewrites
+    the body, signature and AI line kept out and put back, then
+    ghostwriter.lint (links and addresses in neither the draft nor the
+    answers removed, flags added to the card) and card_drafts.edit's own
+    checks and mailbox update (rewrite= hook, held in _EDITING across the
+    model call). It stores answered_questions {index: answer}, returns the
+    card with changed_sentences (new sentences, found in code), 422
+    no_such_question / empty / too_long, 429 too_many past
+    ANSWERS_PER_HOUR (30) per person, 502 rewrite_failed; it sends nothing.
+    Cards carry questions [{text, choices, source, answer}] (from
+    open_questions + question_choices; a card made before choices shows
+    none) and questions_settled. Why choices: tapping an answer beats
+    rewriting the draft by hand on a phone. Send is POST /decisions/{id}/approve (edits carry the
     second yes; 409 confirm / caller_signing_required / draft_gone /
     you_replied / inbox_off / client_slot / the Gmail codes, 429
     rate_limited, 502 gmail_error / send_unconfirmed); Dismiss is POST

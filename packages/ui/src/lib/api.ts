@@ -1,5 +1,6 @@
 import type { AlertApproval } from "@/lib/approvals";
 import type { AnswerSources } from "@/lib/answerSources";
+import type { DirectoryListing, DirectoryOption } from "@/lib/chatDirectory";
 import type { HistoryNote, HistoryState } from "@/lib/history";
 import type { NotificationSettings, NotificationSettingsUpdate } from "@/lib/notifications";
 import type { SetupStatus } from "@/lib/setupStatus";
@@ -2031,6 +2032,24 @@ export interface ReplyCard {
   in_mailbox?: boolean;
   // Which of your mailboxes it sends from: "Gmail" or "Outlook".
   mailbox?: string;
+  // The open questions with answers to tap; absent on an older backend,
+  // and a card made before choices has none.
+  questions?: ReplyQuestion[];
+  // You changed the words by hand: what is left open no longer holds Send.
+  questions_settled?: boolean;
+  // Only from answering: the sentences the rewrite added or changed.
+  changed_sentences?: string[];
+}
+
+// One thing a reply leaves you to decide (GET /delegation/replies).
+export interface ReplyQuestion {
+  text: string;
+  // 2 to 4 short answers to tap, or none.
+  choices: string[];
+  // Where they came from ("I checked your calendar: these are free."), or "".
+  source: string;
+  // The answer you gave on the card, "" while it is open.
+  answer: string;
 }
 
 // "How I write": learned from your own sent mail; you can edit and lock it.
@@ -2325,6 +2344,21 @@ export async function editReplyText(id: number, text: string): Promise<ReplyCard
     body: JSON.stringify({ text }),
   });
   if (!res.ok) throw await delegationError(res, "Couldn't save your change.");
+  return (await res.json()) as ReplyCard;
+}
+
+// Answer what a reply left you to decide: the draft is rewritten with it
+// in your voice and saved on its card (and in your Drafts when it's there).
+export async function answerReplyQuestions(
+  id: number,
+  answers: { question_index: number; answer_text: string }[],
+): Promise<ReplyCard> {
+  const res = await fetch(`${API_BASE}/delegation/replies/${id}/answer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ answers }),
+  });
+  if (!res.ok) throw await delegationError(res, "Couldn't add that to your reply.");
   return (await res.json()) as ReplyCard;
 }
 
@@ -4456,6 +4490,41 @@ export interface PersonCreate {
   availability?: AvailabilityWindow[];
 }
 
+// The Slack, Discord and Telegram people and rooms the bots can reach, by
+// name, for the pickers (lib/chatDirectory.ts). The principal's alone: for
+// anyone else (403), or when it can't be read, this is null and the pickers
+// keep only the by-hand id field.
+async function getDirectory(path: string): Promise<DirectoryListing | null> {
+  try {
+    const res = await fetch(`${API_BASE}/chat-directory/${path}`);
+    if (!res.ok) return null;
+    return (await res.json()) as DirectoryListing;
+  } catch {
+    return null;
+  }
+}
+
+export function getChatDirectoryPeople(): Promise<DirectoryListing | null> {
+  return getDirectory("people");
+}
+
+export function getChatDirectoryChannels(): Promise<DirectoryListing | null> {
+  return getDirectory("channels");
+}
+
+// The Slack person with this work email, or null (no match, no Slack bot, or
+// not the principal).
+export async function findSlackPersonByEmail(email: string): Promise<DirectoryOption | null> {
+  try {
+    const res = await fetch(`${API_BASE}/chat-directory/slack/lookup?email=${encodeURIComponent(email)}`);
+    if (!res.ok) return null;
+    const body = (await res.json()) as { configured: boolean; match: DirectoryOption | null };
+    return body.match ?? null;
+  } catch {
+    return null;
+  }
+}
+
 // Adding, editing and archiving people is the principal's alone (403 for anyone
 // else): the People list is also who can sign in and who the Executive emails.
 const PEOPLE_PRINCIPAL_ONLY = "Only the principal can change the People list.";
@@ -5175,6 +5244,34 @@ export interface WatchlistItem {
   trust_score: number;
   notes: string;
   origin: WatchlistOrigin | string;
+  /** Detail route only: how many of its recent alerts were dismissed. */
+  noise?: WatchNoise;
+}
+
+/** A watch's last alerts (up to 8) since its noise question was last answered. */
+export interface WatchNoise {
+  recent_alerts: number;
+  recent_dismissed: number;
+  /** At least 6 of the last 8 were dismissed: ask whether to make it quieter. */
+  noisy: boolean;
+}
+
+/** A watch written from a sentence (POST /watchlist/describe). Not saved. */
+export interface WatchDraft {
+  slug: string;
+  signal_type: WatchlistSignalType | string;
+  target: string;
+  display_label: string;
+  trigger: Record<string, unknown>;
+  cadence: WatchlistCadence | string;
+  mode: WatchlistMode | string;
+  severity_floor: WatchlistSeverity;
+  severity_ceiling: WatchlistSeverity;
+  notes: string;
+  watching: string;
+  tell_you_when: string;
+  how_often: string;
+  how_loud: string;
 }
 
 export interface WatchlistSignal {
@@ -5218,6 +5315,37 @@ export interface WatchlistPatch {
   severity_ceiling?: WatchlistSeverity;
   trigger?: Record<string, unknown>;
   notes?: string;
+  /** Stop asking whether this watch is too noisy (for the alerts so far). */
+  quiet_noise_nudge?: boolean;
+}
+
+/** Draft a watch from what the person typed. Throws with a plain reason. */
+export async function describeWatch(text: string): Promise<WatchDraft> {
+  const res = await fetch(`${API_BASE}/watchlist/describe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) {
+    throw new Error(await errorDetail(res, "Couldn't read that just now. Try again, or set it up by hand."));
+  }
+  return res.json();
+}
+
+/** The create body for a draft the person approved as it is. */
+export function draftToCreate(draft: WatchDraft): WatchlistCreate {
+  return {
+    slug: draft.slug,
+    signal_type: draft.signal_type,
+    target: draft.target,
+    display_label: draft.display_label,
+    trigger: draft.trigger,
+    cadence: draft.cadence,
+    mode: draft.mode,
+    severity_floor: draft.severity_floor,
+    severity_ceiling: draft.severity_ceiling,
+    notes: draft.notes,
+  };
 }
 
 export async function listWatchlist(options: {
