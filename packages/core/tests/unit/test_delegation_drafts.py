@@ -24,7 +24,9 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     episodic.initialize_db(path)
     caps._SAVED_TODAY.clear()
     caps._IN_FLIGHT.clear()
+    drafts._seen.clear()
     yield path
+    drafts._seen.clear()
     caps._SAVED_TODAY.clear()
     caps._IN_FLIGHT.clear()
 
@@ -153,6 +155,75 @@ async def test_a_chat_draft_sent_in_gmail_stops_waiting() -> None:
     box.asked.clear()
     assert await drafts.settle_waiting(PERSON, now=NOW, gmail=box) == 0
     assert box.asked == ["d2"]
+
+
+async def test_a_waiting_draft_is_named_by_who_it_goes_to_and_its_subject() -> None:
+    _record(1, drafts.SOURCE_CHAT, "t1", "d1")
+    _record(1, drafts.SOURCE_CHAT, None, "d2")
+    day = NOW.replace(hour=0)
+    # Before any settle pass: listed, but nothing read yet.
+    assert [(d.to, d.subject) for d in drafts.waiting_drafts(1, day)] == [((), ""), ((), "")]
+
+    class Box:
+        async def get_draft(self, draft_id: str) -> Any:
+            if draft_id == "d1":
+                return None  # sent
+            message = SimpleNamespace(to=["dana@example.com"], cc=[], subject="Wednesday meeting")
+            return SimpleNamespace(draft_id=draft_id, message=message)
+
+    assert await drafts.settle_waiting(PERSON, now=NOW, gmail=Box()) == 1
+    waiting = drafts.waiting_drafts(1, day)
+    assert [(d.to, d.subject) for d in waiting] == [(("dana@example.com",), "Wednesday meeting")]
+
+
+async def test_a_reply_draft_stops_waiting_once_they_answered_in_the_thread() -> None:
+    """They replied in Gmail themselves instead of sending the draft: the
+    draft is still in Drafts, but it is no longer theirs to review."""
+    answered = _record(1, drafts.SOURCE_CHAT, "t1", "d1", when=NOW - timedelta(hours=3))
+    _record(1, drafts.SOURCE_CHAT, "t2", "d2", when=NOW - timedelta(hours=3))
+    after = (NOW - timedelta(hours=1)).isoformat()
+    before = (NOW - timedelta(hours=5)).isoformat()
+
+    def msg(sender: str, labels: list[str], at: str) -> SimpleNamespace:
+        return SimpleNamespace(from_addr=sender, labels=labels, received_at=at)
+
+    threads = {
+        "t1": [msg("dana@example.com", ["INBOX"], before), msg("owner@example.com", ["SENT"], after)],
+        # Only an older send of theirs, a draft and someone else's mail since.
+        "t2": [
+            msg("owner@example.com", ["SENT"], before),
+            msg("owner@example.com", ["DRAFT"], after),
+            msg("dana@example.com", ["INBOX"], after),
+        ],
+    }
+
+    class Box:
+        async def get_draft(self, draft_id: str) -> Any:
+            return SimpleNamespace(draft_id=draft_id, message=None)
+
+        async def get_thread(self, thread_id: str) -> Any:
+            return SimpleNamespace(messages=threads[thread_id])
+
+    assert await drafts.settle_waiting(PERSON, now=NOW, gmail=Box()) == 1
+    left = drafts._waiting(1, NOW - timedelta(days=1), None)
+    assert [draft_id for _, draft_id in left] == ["d2"]
+    assert (1, answered) not in drafts._seen
+
+
+async def test_one_persons_pass_keeps_anothers_details() -> None:
+    _record(1, drafts.SOURCE_CHAT, None, "d1")
+    _record(2, drafts.SOURCE_CHAT, None, "d2")
+
+    class Box:
+        async def get_draft(self, draft_id: str) -> Any:
+            message = SimpleNamespace(to=["dana@example.com"], cc=[], subject=f"About {draft_id}")
+            return SimpleNamespace(draft_id=draft_id, message=message)
+
+    await drafts.settle_waiting(PERSON, now=NOW, gmail=Box())
+    await drafts.settle_waiting(SimpleNamespace(id=2, email="ben@example.com"), now=NOW, gmail=Box())
+    day = NOW.replace(hour=0)
+    assert [d.subject for d in drafts.waiting_drafts(1, day)] == ["About d1"]
+    assert [d.subject for d in drafts.waiting_drafts(2, day)] == ["About d2"]
 
 
 async def test_settling_reads_nothing_without_recent_chat_drafts() -> None:
