@@ -52,6 +52,13 @@ turn, under every usual check, so it trusts the person's go no more than
 before; it only stops a re-read from undoing it. A shared chat, or mail from
 someone not in People, remembers nothing.
 
+How much a read holds is the owner's setting (``orchestrator.outside_mode``),
+fixed at the start of each turn (``TurnOutside.mode``). Under "Only for
+outsiders" a Gmail search's list of ids marks nothing, and neither does a Gmail message Gmail
+authenticated as a teammate's, or a calendar read naming only the team
+(``mark_read``). Under "Don't ask", on the principal's own turn, nothing but
+mail from someone not in People marks it.
+
 The company's own Drive (``vet_reads``): a Google read that names one
 file, Doc, Sheet, deck or folder by id, when that item is owned by someone
 at the company (or kept on a shared drive only the company organizes) and
@@ -71,6 +78,7 @@ nothing is marked or held.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import contextvars
 import json
@@ -184,6 +192,8 @@ class TurnOutside:
     # that reads defers its reads until those have been made (``defers_read``).
     go_first: tuple[str, ...] = ()
     go_first_done: bool = False
+    # The owner's setting as it applies to this turn (``outside_mode.for_turn``).
+    mode: str = "ask"
     # Google Drive ids checked this turn (``vet_reads``): the company's own,
     # and the rest, so each is looked up once.
     inside_items: set[str] = field(default_factory=set)
@@ -219,12 +229,18 @@ def begin_turn(
         shared=getattr(session, "shared_chat", False) is True,
         previous=_TURN.get(),
     )
+    from openexecutive.orchestrator import outside_mode
+
+    state.mode = outside_mode.for_turn(session)
     if getattr(session, "sender_off_team", False) is True:
         state.sources.add(SENDER)
-    if attachment_blocks or _ATTACHMENT_MARK.search(user_message or ""):
-        state.sources.add(ATTACHMENT)
-    if any(h in (retrieved_context or "") for h in SYNCED_HEADINGS):
-        state.sources.add(SYNCED)
+    # A file or a synced page carries whoever wrote it, not the speaker: it
+    # holds the turn unless the principal chose "Don't ask".
+    if state.mode != outside_mode.TRUST:
+        if attachment_blocks or _ATTACHMENT_MARK.search(user_message or ""):
+            state.sources.add(ATTACHMENT)
+        if any(h in (retrieved_context or "") for h in SYNCED_HEADINGS):
+            state.sources.add(SYNCED)
     key = _held_key(session, state)
     if key:
         stored = _HELD.pop(key, None)
@@ -339,11 +355,236 @@ def current() -> TurnOutside | None:
 
 
 def mark(source: str) -> None:
-    """Record that the turn in progress read outside content. No turn bound:
-    nothing to mark."""
+    """Record that the turn in progress read outside content. No turn bound,
+    or "Don't ask" on the principal's own turn: nothing to mark."""
+    from openexecutive.orchestrator import outside_mode
+
     state = current()
-    if state is not None:
-        state.sources.add(source)
+    if state is None:
+        return
+    if state.mode == outside_mode.TRUST and source != SENDER:
+        return
+    state.sources.add(source)
+
+
+# Under "Only for outsiders", the reads whose result can be told to be the
+# team's (``mark_read``), by tool, and what kind they are. Anything else marks.
+# A Gmail message counts only when Gmail authenticated its sender
+# (``fact_confirmation.sender_authenticated``): a From line is the sender's own
+# text. Outlook has no such check here, so its mail always marks.
+_GMAIL_MESSAGE = "google_workspace__get_gmail_message_content"
+_GMAIL_BATCH = "google_workspace__get_gmail_messages_content_batch"
+_GMAIL_SEARCH = "google_workspace__search_gmail_messages"
+_CALENDAR_READS = frozenset({
+    "google_workspace__get_events",
+    "microsoft_365__list-calendar-events",
+    "microsoft_365__get-calendar-event",
+    "microsoft_365__get-calendar-view",
+})
+# At most this many messages a read checks with Gmail; more marks the turn.
+_MAX_CHECKED = 10
+_ADDRESS = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+# Calendar ids look like addresses but name no one.
+_CALENDAR_IDS = ("calendar.google.com",)
+# Past this many addresses the result is not checked: it counts as outside.
+_MAX_ADDRESSES = 200
+_FROM_LINE = re.compile(r"^\s*From:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+
+
+def _arguments(tool_input: Any) -> dict[str, Any]:
+    arguments = tool_input.get("arguments") if isinstance(tool_input, dict) else None
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (ValueError, RecursionError):
+            return {}
+    return arguments if isinstance(arguments, dict) else {}
+
+
+def _team_addresses() -> set[str]:
+    """The team (not contacts: their mail is outside text, as for the email
+    poller) and the Executive itself, lowercased, by address and alias."""
+    from openexecutive.config import get_settings
+    from openexecutive.people.store import list_people
+
+    found = {str(get_settings().exec_email_address or "").strip().lower()}
+    for person in list_people():
+        for address in [getattr(person, "email", None), *(getattr(person, "email_aliases", None) or [])]:
+            if isinstance(address, str) and address.strip():
+                found.add(address.strip().lower())
+    found.discard("")
+    return found
+
+
+def only_team_addresses(result: Any) -> bool:
+    """Whether every address in ``result`` is the team's, there is at least
+    one, and no ``@`` is left that isn't part of one (an address the pattern
+    can't read, a quoted or non-Latin one, counts as a stranger's). Never
+    raises: an error is no."""
+    try:
+        text = result if isinstance(result, str) else json.dumps(result, default=str)
+        matched = _ADDRESS.findall(text)
+        if len(matched) > _MAX_ADDRESSES or "@" in _ADDRESS.sub("", text):
+            return False
+        found = {a.lower().rstrip(".") for a in matched}
+        found = {a for a in found if not a.endswith(_CALENDAR_IDS)}
+        return bool(found) and found <= _team_addresses()
+    except Exception:
+        return False
+
+
+def _ids_only(result: Any) -> bool:
+    """A Gmail search's plain result: ids and links, no message text."""
+    text = result if isinstance(result, str) else ""
+    return bool(text) and "@" not in text and not re.search(r"subject|from:|snippet|body", text, re.IGNORECASE)
+
+
+async def _gmail_authenticated(tool_input: Any, result: Any, gateway: Any) -> bool:
+    """Whether every message a Gmail read returned came from the team, as
+    Gmail itself authenticated it: each id is read raw and its From must pass
+    ``authenticated_by_gmail``. Never raises: an error is no."""
+    from email.utils import parseaddr
+
+    from openexecutive.integrations.fact_confirmation import sender_authenticated
+
+    try:
+        arguments = _arguments(tool_input)
+        if arguments.get("body_format") == "raw":
+            return False
+        ids: Any = (
+            [arguments.get("message_id")] if tool_input.get("name") == _GMAIL_MESSAGE
+            else arguments.get("message_ids")
+        )
+        if not isinstance(ids, list) or not ids or len(ids) > _MAX_CHECKED:
+            return False
+        if not all(isinstance(i, str) and re.fullmatch(r"[A-Za-z0-9_-]{6,100}", i) for i in ids):
+            return False
+        text = result if isinstance(result, str) else ""
+        senders = [parseaddr(line)[1].strip().lower() for line in _FROM_LINE.findall(text)]
+        team = _team_addresses()
+        if len(senders) != len(ids) or not all(s in team for s in senders):
+            return False
+        checks = await asyncio.gather(*(
+            sender_authenticated(gateway, message_id, sender) for message_id, sender in zip(ids, senders, strict=True)
+        ))
+        return all(checks)
+    except Exception:
+        return False
+
+
+async def from_the_team(tool_input: Any, result: Any, gateway: Any) -> bool:
+    """Whether a read's ``result`` is the team's own text: a Gmail search
+    showing only ids and links; a Gmail message read whose every message
+    Gmail authenticated as sent by a teammate, with no other address in it;
+    or a calendar read of events the Executive itself organized, naming only
+    the team. Never raises: an error is no."""
+    named = tool_input.get("name") if isinstance(tool_input, dict) else None
+    if named == _GMAIL_SEARCH:
+        return _ids_only(result)
+    if named in (_GMAIL_MESSAGE, _GMAIL_BATCH):
+        return only_team_addresses(result) and await _gmail_authenticated(tool_input, result, gateway)
+    if named in _CALENDAR_READS:
+        if named == "google_workspace__get_events":
+            # The plain listing shows titles but not who made each event.
+            arguments = _arguments(tool_input)
+            if arguments.get("detailed") is not True and not arguments.get("event_id"):
+                return False
+            return only_team_addresses(result) and _google_organizers_on_team(result)
+        return only_team_addresses(result) and _graph_organizers_on_team(result)
+    return False
+
+
+def _exec_address() -> str:
+    from openexecutive.config import get_settings
+
+    return str(get_settings().exec_email_address or "").strip().lower()
+
+
+# The fields of a detailed Google event, in the order the gateway writes them
+# (``Description``, ``Location``, ``Color ID``, then ``Organizer`` among the
+# rest). A description or location can hold lines that look like these.
+_EVENT_FIELD = re.compile(r"^\s*-?\s*(Description|Location|Color ID|Organizer):\s*(.*)$", re.MULTILINE)
+
+
+def _google_organizers_on_team(result: Any) -> bool:
+    """A detailed ``get_events`` result where every event was organized by
+    the Executive itself. Each event starts at a ``Description:`` line and
+    must hold exactly one ``Location:``, one ``Color ID:`` and, after them,
+    one ``Organizer:`` carrying exactly the Executive's address (a calendar
+    id, a name with no address, or anyone else is not). A forged field line
+    inside a description or location adds a field where there already is
+    one, or comes before the real ones, so it fails. A teammate's event
+    doesn't count: an invite's organizer is what the mail that brought it
+    says, and mail can be forged. Never raises: an error is no."""
+    try:
+        text = result if isinstance(result, str) else ""
+        own = _exec_address()
+        if not own:
+            return False
+        events: list[list[tuple[str, str]]] = []
+        for match in _EVENT_FIELD.finditer(text):
+            label, value = match.group(1), match.group(2)
+            if label == "Description":
+                events.append([])
+            elif not events:
+                return False
+            else:
+                events[-1].append((label, value))
+        if not events:
+            return False
+        for fields in events:
+            labels = [label for label, _ in fields]
+            if labels != ["Location", "Color ID", "Organizer"]:
+                return False
+            found = [a.lower().rstrip(".") for a in _ADDRESS.findall(fields[2][1])]
+            if found != [own]:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _graph_organizers_on_team(result: Any) -> bool:
+    """A Microsoft 365 calendar result where every event's
+    ``organizer.emailAddress.address`` is the Executive's own (as for
+    Google): a result trimmed (``select``) to leave the organizer out is no
+    one's. Never raises: an error is no."""
+    try:
+        parsed = json.loads(result) if isinstance(result, str) else result
+        events = parsed.get("value") if isinstance(parsed, dict) and "value" in parsed else [parsed]
+        if not isinstance(events, list) or not events:
+            return isinstance(events, list)
+        own = _exec_address()
+        for event in events:
+            address = ((event.get("organizer") or {}).get("emailAddress") or {}).get("address")
+            if not own or not isinstance(address, str) or address.strip().lower() != own:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+async def mark_read(source: str, tool_input: Any, result: Any, gateway: Any = None) -> None:
+    """``mark`` for a read whose result is in hand: under "Only for
+    outsiders", a read that is the team's own (``from_the_team``) marks
+    nothing."""
+    from openexecutive.orchestrator import outside_mode
+
+    state = current()
+    if state is None:
+        return
+    if source == GATEWAY and state.mode == outside_mode.OUTSIDERS and await from_the_team(tool_input, result, gateway):
+        return
+    mark(source)
+
+
+def trusted_turn() -> bool:
+    """Whether the turn in progress is the principal's own under "Don't ask"
+    (``outside_mode.TRUST``): no read, theirs or anyone's, holds it."""
+    from openexecutive.orchestrator import outside_mode
+
+    state = current()
+    return state is not None and state.mode == outside_mode.TRUST
 
 
 def read_outside() -> bool:
