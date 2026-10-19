@@ -42,10 +42,16 @@ meeting gate decides as for any meeting nobody tapped (a time chosen from
 someone's mail must not land on a calendar unasked), so it may go to the
 approver as a proposal.
 
+**On.** With Suggested actions set to On (``training.ACTIONS_ON``, out of
+training), a card is carried out as soon as it is proposed with no allow
+needed, under the same plain-code checks, and only when it reaches nobody new:
+a new contact, or anyone whose roster entry is under ``SETTLED_AFTER`` old,
+waits on its card (``_known_people_refusal``).
+
 **From another AI app.** A card proposed on a turn another AI app asked to
 act (``Session.mcp_client_may_act``) follows the person's mode instead
 (``follow_handle_it``, kept on the card so the check at run time is the
-same): with Suggested actions not in training, it is carried out on its own
+same), On or not: with Suggested actions not in training, it is carried out on its own
 when their Handle it for me is on at a setting that covers people they know
 (every setting does; everyone on a card is on their roster), and the same
 plain-code checks find nothing against it, with a message no longer than
@@ -394,7 +400,7 @@ def on_its_own_refusal(
     """Why a card of ``actions`` may not be carried out on its own (a short
     code), or None when it may. ``follow_handle_it``: a card from another AI
     app, which follows the person's Handle it for me unless Suggested actions
-    is in training. Plain code only; never raises (an error refuses)."""
+    is in training (On doesn't change it). Plain code only; never raises (an error refuses)."""
     try:
         return _on_its_own_refusal(person, actions, now, follow_handle_it=follow_handle_it)
     except Exception:
@@ -417,9 +423,20 @@ def _handle_it_refusal(person: Any, actions: list[dict[str, Any]], now: datetime
         return "new_contact", 0
     if settings.level(handle_it.KIND_REPLY_KNOWN) != handle_it.LEVEL_HANDLE:
         return "level", 0
-    if not all(_settled(pid, person.id, now) for pid in _recipients(actions)):
-        return "new_person", 0
+    refused = _known_people_refusal(person, actions, now)
+    if refused is not None:
+        return refused, 0
     return None, min(ON_ITS_OWN_MESSAGE_MAX, settings.rules.max_body_chars)
+
+
+def _known_people_refusal(person: Any, actions: list[dict[str, Any]], now: datetime) -> str | None:
+    """A card carried out with no allow reaches only people settled on the
+    roster: a new contact, or anyone added lately, waits for a tap."""
+    if any(a.get("kind") == "add_contact" for a in actions):
+        return "new_contact"
+    if not all(_settled(pid, person.id, now) for pid in _recipients(actions)):
+        return "new_person"
+    return None
 
 
 def _recipients(actions: list[dict[str, Any]]) -> list[Any]:
@@ -469,9 +486,12 @@ def _on_its_own_refusal(
 
     if person is None or person.id is None:
         return "training_off"
-    in_training = training.get(person.id).actions
+    switches = training.get(person.id)
+    in_training = switches.actions
+    # A card from another AI app follows Handle it for me, On or not.
     by_mode = follow_handle_it and not in_training
-    if not by_mode and not in_training:
+    on = switches.actions_without_asking and not follow_handle_it
+    if not by_mode and not in_training and not on:
         return "training_off"
     if not can_delegate(person) or not is_enabled(person.id):
         return "act_as_me_off"
@@ -482,6 +502,10 @@ def _on_its_own_refusal(
     message_max = ON_ITS_OWN_MESSAGE_MAX
     if by_mode:
         refused, message_max = _handle_it_refusal(person, actions, now)
+        if refused is not None:
+            return refused
+    elif on:
+        refused = _known_people_refusal(person, actions, now)
         if refused is not None:
             return refused
     elif any(training.allowed_action(person.id, a) is None for a in actions):
@@ -638,7 +662,7 @@ async def approve(
         from openexecutive.delegation import training
 
         if not training.get(person.id).actions:
-            raise ApproveRefused(422, "cant_allow", "Approve + allow is for cards while Suggested actions is in training.")
+            raise ApproveRefused(422, "cant_allow", "Doing this on its own next time is for cards while Suggested actions is in training.")
         keys = [found[0] for i in chosen if (found := training.action_key(person.id, actions[i])) is not None]
         if not keys:
             raise ApproveRefused(422, "cant_allow", "Nothing on this card can be allowed.")
