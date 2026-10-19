@@ -17,6 +17,11 @@ already hold them:
     saved in the principal's own Gmail and not yet sent or deleted there
     (``delegation.drafts``, private).
   • CONVERSATIONS — the principal's web chat sessions active in the window.
+  • OWN — the principal's own mail and chat-app messages to the Executive,
+    kept out of INBOUND. They are background (what the reader already said
+    and asked), never news: as INBOUND lines the header led with "you've
+    been messaging me heavily tonight" and restated the reader's own
+    complaint as the day's headline.
   • CALENDAR — today's remaining events, from an in-process cache the
     scheduler and the morning brief refresh. The /today hot path never makes
     the calendar call itself; it reads the cache. Private to the principal.
@@ -50,6 +55,7 @@ logger = logging.getLogger(__name__)
 _INBOUND_MAX = 10
 _STUCK_MAX = 6
 _CONVERSATIONS_MAX = 5
+_OWN_MAX = 6
 _CALENDAR_MAX = 6
 # How many audit rows each query reads. A busy day's inbound is well under
 # this; the cap keeps a flood from turning one page load into a scan.
@@ -174,10 +180,15 @@ class LiveSignals:
     stuck: tuple[str, ...] = ()
     drafts: int = 0
     conversations: tuple[str, ...] = ()
+    # The reader's own messages to the Executive, newest first. Background,
+    # so they never make the window non-empty on their own.
+    own: tuple[str, ...] = ()
     # None: no calendar was read (none connected, or not cached yet).
     # (): read, and nothing left today.
     calendar: tuple[str, ...] | None = None
     # Stable identities for the brief's "unchanged" fingerprint — no times.
+    # The reader's own messages are left out: chatting with the Executive
+    # is not a reason to send a brief.
     keys: dict[str, Any] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
@@ -206,9 +217,11 @@ def _audit_rows(event_type: str, since: datetime, include_private: bool) -> list
 
 def _inbound(
     since: datetime, tz: tzinfo, include_private: bool, now: datetime | None = None,
-) -> tuple[list[str], int, int, list[str], list[str]]:
-    """``(lines, total, shown, stuck_lines, keys)`` from ``integration_inbound``
-    rows. ``shown`` is how many messages the grouped lines cover.
+) -> tuple[list[str], int, int, list[str], list[str], list[str]]:
+    """``(lines, total, shown, stuck_lines, keys, own)`` from
+    ``integration_inbound`` rows. ``shown`` is how many messages the grouped
+    lines cover. ``own`` holds the principal's own messages to the Executive,
+    which are not counted in ``total``; only with ``include_private``.
 
     A message handled twice (logged twice under one message id) counts once.
     Mail from the principal is labelled as theirs, and, with
@@ -223,6 +236,7 @@ def _inbound(
     stuck: list[str] = []
     stuck_seen: set[str] = set()
     seen_ids: set[str] = set()
+    own: list[str] = []
     total = 0
     principal_person = _principal()
     principal = _principal_addresses(principal_person)
@@ -256,14 +270,17 @@ def _inbound(
             if message_id in seen_ids:
                 continue
             seen_ids.add(message_id)
-        total += 1
         channel = str(details.get("channel") or "")
         reply = ""
+        # Set only where the principal is actually identified, never from the
+        # label: a chat display name can read "the reader" too.
+        is_own = False
         if channel == "email":
             address = str(details.get("from") or "").strip().lower()
             sender = _one_line(details.get("from"), 80)
             if address and address in principal:
                 sender = "the reader"
+                is_own = True
             topic = _one_line(details.get("subject"), 100)
             # The cards are private to the principal: their reading stays out
             # of a shared read.
@@ -285,11 +302,22 @@ def _inbound(
                 sender = sender[len(f"{channel} from "):]
             if _is_principal_chat(details, principal_person):
                 sender = "the reader"
+                is_own = True
             topic = _one_line(text, 100)
-        if sender != "the reader" and _uses_principal_name(sender, principal_person):
+        if is_own:
+            if include_private and len(own) < _OWN_MAX:
+                # The reply status goes ahead of the quoted text, so an ask
+                # whose reply never went out still reads as open.
+                status = f" ({reply})" if reply else ""
+                own.append(
+                    f"[{_local_hhmm(ev.ts, tz, now)}] {channel or 'message'}{status}: {topic}"
+                )
+            continue
+        if sender.lower() == "the reader" or _uses_principal_name(sender, principal_person):
             # Someone else whose display name holds the reader's name: the
             # brief masks that name, so say plainly it isn't them.
             sender = _IMPOSTOR
+        total += 1
         group_key = (sender.lower(), re.sub(r"^(re|fwd?):\s*", "", topic.lower()))
         group = groups.get(group_key)
         if group is None:
@@ -322,7 +350,7 @@ def _inbound(
         lines.append(line)
         key = f"{g['sender'].lower()}|{g['topic'].lower()[:60]}|{g['count']}"
         keys.append(f"{key}|{g['reply']}" if g["reply"] else key)
-    return lines, total, shown, stuck, keys
+    return lines, total, shown, stuck, keys, own
 
 
 def _replied_threads(since: datetime, include_private: bool) -> dict[str, str]:
@@ -546,9 +574,12 @@ def gather_live_signals(
     inbound: list[str] = []
     inbound_keys: list[str] = []
     stuck: list[str] = []
+    own: list[str] = []
     total = shown = 0
     try:
-        inbound, total, shown, stuck, inbound_keys = _inbound(since, tz, include_private, now)
+        inbound, total, shown, stuck, inbound_keys, own = _inbound(
+            since, tz, include_private, now,
+        )
     except Exception:
         logger.exception("live_signals: inbound read failed")
     try:
@@ -594,6 +625,7 @@ def gather_live_signals(
         stuck=tuple(stuck),
         drafts=drafts,
         conversations=tuple(conversations),
+        own=tuple(own),
         calendar=calendar_lines,
         keys={
             "inbound": sorted(inbound_keys),
@@ -634,8 +666,19 @@ def render_live_blocks(signals: LiveSignals, *, window: str) -> list[str]:
                 "Gmail (Act as me), waiting for them to review and send"
             )
         parts.append("")
+    background = "background only: what the reader already said and asked, never news"
+    if signals.own:
+        parts.append(
+            f"THE READER'S OWN MESSAGES TO THE EXECUTIVE {window.upper()} "
+            f"({background}; newest first; {quoted}):"
+        )
+        parts.extend(f"- {line}" for line in signals.own)
+        parts.append("")
     if signals.conversations:
-        parts.append(f"CONVERSATIONS WITH THE EXECUTIVE {window.upper()} (titles {quoted}):")
+        parts.append(
+            f"THE READER'S CONVERSATIONS WITH THE EXECUTIVE {window.upper()} "
+            f"({background}; titles {quoted}):"
+        )
         parts.extend(f"- {line}" for line in signals.conversations)
         parts.append("")
     if signals.calendar is not None:
