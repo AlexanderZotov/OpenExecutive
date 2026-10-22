@@ -25,7 +25,7 @@ from openexecutive.audit.usage import log_model_usage
 from openexecutive.config import get_settings
 from openexecutive.delegation.lockdown import (
     mail_touched_withheld_error,
-    mail_touched_withholds,
+    mail_turn_withholds,
 )
 from openexecutive.delegation.settings import (
     block0_delegation_on,
@@ -2675,16 +2675,23 @@ class Executive:
             # but is not locked: it is the person asking again. The offered
             # list stays as it is, so the cached prefix never changes
             # mid-turn.
+            # How much of it holds is the safety level's, like any read: every
+            # mail read is checked once its round is done (check_mail_read
+            # below), and Balanced then holds it all only if one was flagged
+            # or too big to check; a round that reads mail holds it all for
+            # that round, since its reads aren't checked yet. Posts to
+            # everyone and roster changes stay shut at every level
+            # (delegation.lockdown.mail_turn_withholds).
             mail_touched_uses: list[dict[str, Any]] = []
-            # Under "Don't ask", on the principal's own turn, reading their
-            # mail holds nothing (orchestrator.outside_mode).
-            if pinned_delegation is not None and not outside_content.trusted_turn() and (
-                pinned_delegation.read_mail
-                or any(tu["name"] in MAILBOX_TOOL_NAMES or tu["name"] in HISTORY_TOOL_NAMES for tu in dispatch_uses)
-            ):
+            reads_mail_now = any(
+                tu["name"] in MAILBOX_TOOL_NAMES or tu["name"] in HISTORY_TOOL_NAMES for tu in dispatch_uses
+            )
+            if pinned_delegation is not None and (pinned_delegation.read_mail or reads_mail_now):
                 mail_touched_uses = [
                     tu for tu in [*skill_tool_uses, *mcp_tool_uses, *script_tool_uses]
-                    if mail_touched_withholds(tu["name"], tu["input"])
+                    if mail_turn_withholds(
+                        tu["name"], tu["input"], reading_now=reads_mail_now, pinned=pinned_delegation
+                    )
                 ]
             if mail_touched_uses:
                 skill_tool_uses = [tu for tu in skill_tool_uses if tu not in mail_touched_uses]
@@ -3374,6 +3381,13 @@ class Executive:
                         probe_name, probe_input
                     ):
                         return outside_content.outside_withheld_error(tool[:200]), True
+                    # The owner's mail this turn read holds what a direct call
+                    # would hold (delegation.lockdown.mail_turn_withholds):
+                    # an alert or a roster change at any level.
+                    if pinned_delegation is not None and mail_turn_withholds(
+                        probe_name, probe_input, pinned=pinned_delegation
+                    ):
+                        return mail_touched_withheld_error(tool[:200]), True
                     if not own:
                         await outside_content.vet_reads(
                             [{"name": probe_name, "input": probe_input}], self._mcp_gateway
@@ -3633,6 +3647,26 @@ class Executive:
                     )
                     if notice:
                         results_by_id[tu["id"]] = _with_notice(results_by_id.get(tu["id"], ""), notice)
+            # The owner's own mail this round read is checked the same way,
+            # and decides how much of the Act as me lockdown holds from the
+            # next round on (delegation.lockdown.mail_lock_holds).
+            if pinned_delegation is not None and reads_mail_now:
+                for tu in dispatch_uses:
+                    if tu["name"] not in MAILBOX_TOOL_NAMES and tu["name"] not in HISTORY_TOOL_NAMES:
+                        continue
+                    notice = await outside_content.check_mail_read(
+                        pinned_delegation, results_by_id.get(tu["id"], "")
+                    )
+                    if notice:
+                        results_by_id[tu["id"]] = _with_notice(results_by_id.get(tu["id"], ""), notice)
+                # A script that ran beside the read may have read mail the
+                # loop never checks: the turn stays unvetted.
+                ran_script = any(
+                    tu["name"] in (step_script.RUN_SCRIPT_TOOL, "run_python_job")
+                    for tu in [*skill_tool_uses, *mcp_tool_uses, *script_tool_uses]
+                )
+                if not ran_script:
+                    outside_content.check_mail_reads_done(pinned_delegation)
 
             current_messages.append({"role": "assistant", "content": response_content})
             # Cap here, at the single point every result reaches the model,
