@@ -473,6 +473,70 @@ async def save_designer_edit(name: str, request: Request) -> dict[str, Any]:
     return _with_owner(stored)
 
 
+def _tapper_person_id(who: Any) -> int | None:
+    """The People entry of a card's tapper: a request's caller, or a chat
+    app's proven tap (``ChatTap``)."""
+    if isinstance(who, api_caller.Caller):
+        return api_caller.person_id_for(who)
+    from openexecutive.people.store import find_person_by_email
+
+    email = str(getattr(who, "email", "") or "")
+    person = find_person_by_email(email) if email else None
+    return person.id if person is not None else None
+
+
+async def apply_chat_change(
+    name: str, definition: dict[str, Any], base: Any, who: Any
+) -> DynamicWorkflowDef:
+    """Save a change chat staged on a card (``orchestrator.workflow_change``),
+    on its person's tap. ``base`` is the version the card was made from: a
+    workflow changed since is a 409, so the tap saves only what the card
+    showed. ``who`` is the tapper (a request's caller, or a chat app's proven
+    tap), checked as a save from the Workflows page is. The on/off state is
+    kept."""
+    from openexecutive.delegation.workflow_email import save_refusal
+    from openexecutive.people.store import is_principal_or_self
+
+    current = get_definition(name)
+    if current is None:
+        raise HTTPException(status_code=404, detail="That workflow isn't there any more.")
+    if not _reviewed_matches(current, base):
+        raise HTTPException(
+            status_code=409,
+            detail="This workflow changed since the card was made, so nothing was changed. Ask again in chat.",
+        )
+    try:
+        defn = DynamicWorkflowDef.model_validate(definition)
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="This change can't be read any more. Ask again in chat.") from None
+    if defn.name != name:
+        raise HTTPException(status_code=422, detail="This change is for a different workflow.")
+    defn = defn.model_copy(update={"is_active": current.is_active})
+    errors = await validate_definition_and_tools(defn)
+    if errors:
+        raise HTTPException(status_code=422, detail="; ".join(errors)[:300])
+    owner = get_owner(name)
+    # The card may be a day old: whoever taps must still be the account owner
+    # or the workflow's creator, as when it was staged.
+    if not is_principal_or_self(_tapper_person_id(who), owner):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the account owner or the person who created this workflow can change it.",
+        )
+    for checked, stored in ((defn, False), (current, True)):
+        refused = save_refusal(checked, who, owner, check_tools=not stored)
+        if refused is not None:
+            raise HTTPException(status_code=403, detail=refused)
+    saved = save_if_unchanged(defn, current)
+    if saved is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This workflow changed while saving, so nothing was changed. Ask again in chat.",
+        )
+    _sync_cadence(saved)
+    return saved
+
+
 @router.post("/workflows/custom/{name}/activate")
 async def activate_custom_workflow(name: str, request: Request) -> dict[str, Any]:
     """Turn a custom workflow on or off.
