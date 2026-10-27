@@ -652,11 +652,15 @@ class OwnInbox:
     others_total: int = 0
     # Per line: the email's ids and its open reply card, if any.
     refs: tuple[dict[str, Any], ...] = ()
+    # Mail from people they deal with, before ``lines`` is cut to its cap.
+    total: int = 0
 
 
 def own_inbox(since: datetime, tz: tzinfo, now: datetime | None = None) -> OwnInbox:
     """Mail to the principal's own inbox since ``since`` (by when it arrived),
-    as the Act as me watcher recorded it. Private; never raises."""
+    as the Act as me watcher recorded it, leaving out any they have answered
+    since it came (``waiting_on.replied``). Private; never raises."""
+    from openexecutive.briefing import waiting_on
     from openexecutive.delegation import inbox as watcher
 
     principal = _principal()
@@ -678,6 +682,7 @@ def own_inbox(since: datetime, tz: tzinfo, now: datetime | None = None) -> OwnIn
         return OwnInbox()
     picked: list[dict[str, Any]] = []
     seen: set[str] = set()
+    answered = waiting_on.replied()
     for ev in rows:  # newest first
         d = ev.details if isinstance(ev.details, dict) else {}
         message_id = str(d.get("message_id") or "")
@@ -689,6 +694,11 @@ def own_inbox(since: datetime, tz: tzinfo, now: datetime | None = None) -> OwnIn
         arrived = parse_aware(str(d.get("received_at") or "")) or parse_aware(ev.ts)
         if arrived is None or arrived < since:
             continue
+        # They wrote in the thread after it came: handled, whatever the
+        # watcher made of it.
+        replied = answered.get(str(d.get("thread_id") or ""))
+        if replied is not None and replied > arrived:
+            continue
         picked.append(d | {"_at": arrived})
     picked.sort(key=lambda d: d["_at"], reverse=True)
     done = watcher.outcomes(principal.id, [str(d["message_id"]) for d in picked])
@@ -696,6 +706,7 @@ def own_inbox(since: datetime, tz: tzinfo, now: datetime | None = None) -> OwnIn
     refs: list[dict[str, Any]] = []
     others: list[str] = []
     others_total = 0
+    total = 0
     for d in picked:
         address = str(d.get("from_email") or "")
         name = _one_line(d.get("from_name"), 60)
@@ -711,6 +722,7 @@ def own_inbox(since: datetime, tz: tzinfo, now: datetime | None = None) -> OwnIn
                 who = name or _one_line(address, 60)
                 others.append(_one_line(f"{who}: {subject}", 90))
             continue
+        total += 1
         if len(lines) >= _INBOX_MAX:
             continue
         who = f"{name} ({address})" if name and address else _named(address, True)
@@ -731,7 +743,7 @@ def own_inbox(since: datetime, tz: tzinfo, now: datetime | None = None) -> OwnIn
         line = f"[{at}] from {who}: \"{subject}\""
         lines.append(f"{line} — {what}" if what else line)
         refs.append(_mail_ref(d))
-    return OwnInbox(tuple(lines), tuple(others), others_total, tuple(refs))
+    return OwnInbox(tuple(lines), tuple(others), others_total, tuple(refs), total)
 
 
 def _mail_ref(d: dict[str, Any]) -> dict[str, Any]:
