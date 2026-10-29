@@ -4818,8 +4818,10 @@ people:
     Not covered: nudges on the email channel (the MCP mail tool bypasses the
     send handlers — routing still defers them for quiet hours, but they are
     never digest-held); department channel broadcasts (rooms, not a person);
-    alerts.dispatcher channels (web SSE, a self-addressed email, and a Slack
-    DM stub); Act as me approval cards (untagged, and approvals anyway).
+    alerts.dispatcher channels (web SSE and a self-addressed email; the
+    slack_dm channel sends a high or urgent alert through the send handlers
+    to its person's first chat app, people.reach order); Act as me approval
+    cards (untagged, and approvals anyway).
     Department check-ins send no DM: their proposals become approval cards.
   scope_tokens: |
     People can be queried by scope token via
@@ -8678,6 +8680,30 @@ integrations:
     tapper. Either way the tapper must be on the roster by their app id.
     Every other chat app (channels, threads, Google Chat) sends no card,
     and ``propose_actions`` tells the model the card is on Today.
+
+    Every card that waits, in the chat app. ``CHAT_CARD_CLASSES`` also holds
+    the cards that wait outside any chat: a reply card (Send and Skip; Send
+    is ``send_approved_reply`` with the ChatTap, and a second-yes refusal
+    says to open it in the app), an invite (Accept and Skip), and a Take the
+    lead or department card (done as it stands). ``channel_cards.push_waiting``
+    (scheduler tick, once a minute) sends each open ``propose`` card with no
+    conversation of its own person once (``chat_card_pushes``), after two
+    minutes and within a day, to the approver's first chat app that proves
+    taps (``chat_for``), outside quiet hours, five a person a pass; a failed
+    send is tried again on later passes, three tries in all; audit ``chat_card_sent``. A reply, Take the lead or
+    department card is shown whole (the whole draft, every field of the held
+    call) or not at all: over CARD_MAX (1800) it is neither pushed nor
+    approvable from a chat.
+
+    Chat messages asking the principal. ``slack_bot.note_chat_ask`` runs on
+    every Slack channel message the bot receives: a mention of the
+    principal by someone else is kept in ``chat_asks`` (with the permalink
+    and channel name); the principal's own message answers the asks in the
+    same thread, or every earlier one in that channel when it is top-level.
+    ``live_signals.chat_asks`` gives Right now the unanswered ones older than
+    30 minutes and younger than a day (principal only), with a
+    ``{kind: link, url, app}`` source that Home opens; the model never sees
+    the link.
 
     Errors. The catch-all logs with session/user/channel/thread/mode,
     writes an ``integration_inbound`` row with
